@@ -52,6 +52,8 @@ var OrderSelectorWidget = PosBaseWidget.extend({
                 'title': _t('Destroy Current Order ?'),
                 'body': _t('You will lose any data associated with the current order'),
                 confirm: function(){
+                    order.r_state ='void';
+                    self.pos.push_order(order);
                     self.pos.delete_current_order();
                 },
             });

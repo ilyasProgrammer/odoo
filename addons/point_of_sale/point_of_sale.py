@@ -749,6 +749,63 @@ class pos_order(osv.osv):
             }, context=context)
         return order_id
 
+    def _process_order2(self, cr, uid, order, context=None):
+        #Вызывается если ордер уже существует и его надо изменить
+        session = self.pool.get('pos.session').browse(cr, uid, order['pos_session_id'], context=context)
+
+        if session.state == 'closing_control' or session.state == 'closed':
+            session_id = self._get_valid_session(cr, uid, order, context=context)
+            session = self.pool.get('pos.session').browse(cr, uid, session_id, context=context)
+            order['pos_session_id'] = session_id
+
+        existing_orders_ids = self.search(cr, uid, [('pos_reference', '=', order['name'] )], context=context)
+        order_id = existing_orders_ids[0]
+        ord_obj = self.browse(cr, uid, order_id, context=context)
+        journal_ids = set()
+        for payments in order['statement_ids']:
+            #Если платежа нет то можно добавить.
+            # TODO Сделать нормальный фильтр
+            all_ids = self.pool['account.bank.statement.line'].search(cr, uid,[], context=context)
+            all_obj = self.pool['account.bank.statement.line'].browse(cr, uid,all_ids, context=context)
+            m = [x for x in self.pool['pos.order'].browse(cr, uid,self.pool['pos.order'].search(cr,uid,[],context), context=context)]
+            l = [x for x in all_obj]
+            order_acc_lines = [x.pos_statement_id.pos_reference for x in all_obj if x.pos_statement_id.pos_reference == ord_obj.pos_reference]
+            if payments[2]['statement_id'] not in [r.id for r in order_acc_lines]  :
+                self.add_payment(cr, uid, order_id, self._payment_fields(cr, uid, payments[2], context=context),
+                             context=context)
+                journal_ids.add(payments[2]['journal_id'])
+        #TODO проверить что тут вообще
+        if session.sequence_number <= order['sequence_number']:
+            session.write({'sequence_number': order['sequence_number'] + 1})
+            session.refresh()
+        #TODO add addition of new order lines. Deleted lines what to do ? Modifyed lines got to modify.
+        #Сдача
+        if not float_is_zero(order['amount_return'],
+                             self.pool.get('decimal.precision').precision_get(cr, uid, 'Account')):
+            cash_journal = session.cash_journal_id.id
+            if not cash_journal:
+                # Select for change one of the cash journals used in this payment
+                cash_journal_ids = self.pool['account.journal'].search(cr, uid, [
+                    ('type', '=', 'cash'),
+                    ('id', 'in', list(journal_ids)),
+                ], limit=1, context=context)
+                if not cash_journal_ids:
+                    # If none, select for change one of the cash journals of the POS
+                    # This is used for example when a customer pays by credit card
+                    # an amount higher than total amount of the order and gets cash back
+                    cash_journal_ids = [statement.journal_id.id for statement in session.statement_ids
+                                        if statement.journal_id.type == 'cash']
+                    if not cash_journal_ids:
+                        raise UserError(_("No cash statement found for this session. Unable to record returned cash."))
+                cash_journal = cash_journal_ids[0]
+            self.add_payment(cr, uid, order_id, {
+                'amount': -order['amount_return'],
+                'payment_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'payment_name': _('return'),
+                'journal': cash_journal,
+            }, context=context)
+        return order_id
+
     def create_from_ui(self, cr, uid, orders, context=None):
         # Keep only new orders
         submitted_references = [o['data']['name'] for o in orders]
@@ -756,25 +813,52 @@ class pos_order(osv.osv):
         existing_orders = self.read(cr, uid, existing_order_ids, ['pos_reference'], context=context)
         existing_references = set([o['pos_reference'] for o in existing_orders])
         orders_to_save = [o for o in orders if o['data']['name'] not in existing_references]
+        orders_to_change = [o for o in orders if o['data']['name'] in existing_references
+                            and o['data']['r_state'] != 'void']
+        order_ids_to_change = []
+        for tmp_order in orders_to_change:
+            to_invoice = tmp_order['to_invoice']
+            order = tmp_order['data']
+            order_id = self._process_order2(cr, uid, order, context=context)
+            order_ids_to_change.append(order_id)
+            try:
+                self.signal_workflow(cr, uid, [order_id], 'paid')
+            except Exception as e:
+                _logger.error('Could not fully process the POS Order: %s', tools.ustr(e))
+            if to_invoice:
+                self.action_invoice(cr, uid, [order_id], context)
+                order_obj = self.browse(cr, uid, order_id, context)
+                self.pool['account.invoice'].signal_workflow(cr, SUPERUSER_ID, [order_obj.invoice_id.id], 'invoice_open')
+
 
         order_ids = []
 
         for tmp_order in orders_to_save:
             to_invoice = tmp_order['to_invoice']
             order = tmp_order['data']
+            #Создается новый ордер
             order_id = self._process_order(cr, uid, order, context=context)
             order_ids.append(order_id)
-
-            try:
-                self.signal_workflow(cr, uid, [order_id], 'paid')
-            except Exception as e:
-                _logger.error('Could not fully process the POS Order: %s', tools.ustr(e))
+            #При валидации все заказы должны быть оплачены. Чтобы сохраненные из других мест заказы не создавали ошибку:
+            if tmp_order['data'].get('r_state') == 'void':
+                created_order = self.browse(cr, uid, order_id, context=context)
+                created_order.state = 'cancel'
+                try:
+                    self.signal_workflow(cr, uid, [order_id], 'cancel')
+                except Exception as e:
+                    _logger.error('Could not fully process the POS Order: %s', tools.ustr(e))
+            elif tmp_order['data'].get('r_state') == 'unpaid':
+                created_order = self.browse(cr, uid, order_id, context=context)
+            else:
+                try:
+                    self.signal_workflow(cr, uid, [order_id], 'paid')
+                except Exception as e:
+                    _logger.error('Could not fully process the POS Order: %s', tools.ustr(e))
 
             if to_invoice:
                 self.action_invoice(cr, uid, [order_id], context)
                 order_obj = self.browse(cr, uid, order_id, context)
                 self.pool['account.invoice'].signal_workflow(cr, SUPERUSER_ID, [order_obj.invoice_id.id], 'invoice_open')
-
         return order_ids
 
     def write(self, cr, uid, ids, vals, context=None):
