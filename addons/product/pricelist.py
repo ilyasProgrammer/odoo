@@ -85,9 +85,17 @@ class product_pricelist(osv.osv):
             comp = self.pool.get('res.company').browse(cr, uid, comp_id)
         return comp.currency_id.id
 
+    def _get_item_ids(self, cr, uid, ctx):
+        ProductPricelistItem = self.pool.get('product.pricelist.item')
+        fields_list = ProductPricelistItem._defaults.keys()
+        vals = ProductPricelistItem.default_get(cr, uid, fields_list, context=ctx)
+        vals['compute_price'] = 'formula'
+        return [[0, False, vals]]
+
     _defaults = {
         'active': lambda *a: 1,
-        "currency_id": _get_currency
+        "currency_id": _get_currency,
+        'item_ids': _get_item_ids,
     }
 
     def price_rule_get_multi(self, cr, uid, ids, products_by_qty_by_partner, context=None):
@@ -242,8 +250,7 @@ class product_pricelist(osv.osv):
                 break
             # Final price conversion into pricelist currency
             if suitable_rule and suitable_rule.compute_price != 'fixed' and suitable_rule.base != 'pricelist':
-                user_company = self.pool['res.users'].browse(cr, uid, uid, context=context).company_id
-                price = self.pool['res.currency'].compute(cr, uid, user_company.currency_id.id, pricelist.currency_id.id, price, context=context)
+                price = self.pool['res.currency'].compute(cr, uid, product.currency_id.id, pricelist.currency_id.id, price, context=context)
 
             results[product.id] = (price, suitable_rule and suitable_rule.id or False)
         return results
